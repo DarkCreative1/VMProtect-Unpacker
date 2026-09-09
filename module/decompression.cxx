@@ -11,6 +11,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace
 {
@@ -59,6 +60,8 @@ namespace
     constexpr auto k_rep_len_coder = k_len_coder + k_num_len_probs;
     constexpr auto k_literal = k_rep_len_coder + k_num_len_probs;
     constexpr auto k_base_probs = k_literal;
+    constexpr auto k_lzma_probe = 512u;
+    constexpr std::uint8_t k_lzma_props_stock[ ] = { 0x5D, 0x00, 0x00, 0x00, 0x04 };
 
 #pragma pack( push, 1 )
     struct packer_info
@@ -201,23 +204,116 @@ namespace
         return pe;
     }
 
-    auto rva_to_offset( const pe_view& pe, std::uint32_t rva ) -> std::uint32_t
+    auto try_raw_of( const pe_view& pe, std::uint32_t rva, std::uint32_t& off ) -> bool
     {
+        if ( rva < pe.size_of_headers )
+        {
+            if ( rva >= pe.size )
+                return false;
+            off = rva;
+            return true;
+        }
+
         for ( std::uint32_t i = 0; i < pe.section_count; ++i )
         {
             const auto& s = pe.sections[ i ];
             const auto span = ( std::max )( s.Misc.VirtualSize, s.SizeOfRawData );
             if ( !span )
                 continue;
+            if ( rva < s.VirtualAddress || rva >= s.VirtualAddress + span )
+                continue;
+            if ( !s.PointerToRawData || !s.SizeOfRawData )
+                return false;
 
-            if ( rva >= s.VirtualAddress && rva < s.VirtualAddress + span )
-                return s.PointerToRawData + ( rva - s.VirtualAddress );
+            const auto delta = rva - s.VirtualAddress;
+            if ( delta >= s.SizeOfRawData )
+                return false;
+
+            const auto raw = s.PointerToRawData + delta;
+            if ( raw >= pe.size )
+                return false;
+
+            off = raw;
+            return true;
         }
 
-        if ( rva < pe.size_of_headers )
-            return rva;
+        return false;
+    }
 
-        throw std::runtime_error( "Cannot convert RVA to file offset: " + hex( rva ) );
+    auto rva_to_offset( const pe_view& pe, std::uint32_t rva ) -> std::uint32_t
+    {
+        std::uint32_t off = 0;
+        if ( !try_raw_of( pe, rva, off ) )
+            throw std::runtime_error( "Cannot convert RVA to file offset: " + hex( rva ) );
+        return off;
+    }
+
+    auto packed_dests( const pe_view& pe ) -> std::vector< std::uint32_t >
+    {
+        std::vector< std::uint32_t > out;
+        for ( std::uint32_t i = 0; i < pe.section_count; ++i )
+        {
+            const auto& s = pe.sections[ i ];
+            if ( s.SizeOfRawData )
+                continue;
+            if ( s.PointerToRawData )
+                continue;
+            if ( s.Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA )
+                continue;
+            out.push_back( s.VirtualAddress );
+        }
+        return out;
+    }
+
+    auto rol32( std::uint32_t v, unsigned n ) -> std::uint32_t
+    {
+        n &= 31u;
+        if ( !n )
+            return v;
+        return ( v << n ) | ( v >> ( 32u - n ) );
+    }
+
+    auto is_dest_va( const std::vector< std::uint32_t >& dests, std::uint32_t va ) -> bool
+    {
+        for ( auto d : dests )
+        {
+            if ( d == va )
+                return true;
+        }
+        return false;
+    }
+
+    struct raw_span
+    {
+        std::size_t begin;
+        std::size_t end;
+    };
+
+    auto raw_spans( const pe_view& pe ) -> std::vector< raw_span >
+    {
+        std::vector< raw_span > out;
+        for ( std::uint32_t i = 0; i < pe.section_count; ++i )
+        {
+            const auto& s = pe.sections[ i ];
+            if ( !s.PointerToRawData || !s.SizeOfRawData )
+                continue;
+
+            const auto begin = static_cast< std::size_t >( s.PointerToRawData );
+            if ( begin >= pe.size )
+                continue;
+
+            auto end = begin + s.SizeOfRawData;
+            if ( end > pe.size )
+                end = pe.size;
+            if ( end <= begin )
+                continue;
+
+            raw_span sp{};
+            sp.begin = begin;
+            sp.end = end;
+            out.push_back( sp );
+        }
+        return out;
     }
 
     auto section_name( const IMAGE_SECTION_HEADER& s ) -> std::string
@@ -521,6 +617,180 @@ namespace
 
         return out;
     }
+
+    auto probe_lzma( const std::uint8_t* props, std::size_t props_size, const std::uint8_t* src, std::size_t src_size ) -> bool
+    {
+        try
+        {
+            const auto decoded = lzma_decompress( props, props_size, src, src_size, k_lzma_probe );
+            return !decoded.empty( );
+        }
+        catch ( ... )
+        {
+            return false;
+        }
+    }
+
+    auto block_raw( const pe_view& pe, std::uint32_t src, std::uint32_t& off ) -> bool
+    {
+        if ( !try_raw_of( pe, src, off ) )
+            return false;
+        if ( off >= pe.size )
+            return false;
+        return pe.data[ off ] == 0;
+    }
+
+    auto find_legacy( const pe_view& pe, const std::vector< std::uint32_t >& dests, std::vector< packer_info >& infos, const std::uint8_t*& props, std::size_t& props_size ) -> bool
+    {
+        if ( dests.empty( ) )
+            return false;
+
+        std::vector< std::uint8_t > pat;
+        pat.reserve( dests.size( ) * 8 );
+        for ( auto va : dests )
+        {
+            pat.insert( pat.end( ), { 0xFF, 0xFF, 0xFF, 0xFF } );
+            pat.push_back( static_cast< std::uint8_t >( va ) );
+            pat.push_back( static_cast< std::uint8_t >( va >> 8 ) );
+            pat.push_back( static_cast< std::uint8_t >( va >> 16 ) );
+            pat.push_back( static_cast< std::uint8_t >( va >> 24 ) );
+        }
+
+        const auto pos = find_pattern( pe.data, pe.size, pat.data( ), pat.size( ) );
+        if ( pos < 8 )
+            return false;
+
+        const auto n = dests.size( );
+        const auto off = static_cast< std::size_t >( pos ) - 8;
+        if ( off + ( n + 1 ) * sizeof( packer_info ) > pe.size )
+            return false;
+
+        infos.resize( n + 1 );
+        std::memcpy( infos.data( ), pe.data + off, ( n + 1 ) * sizeof( packer_info ) );
+
+        std::uint32_t props_off = 0;
+        if ( !try_raw_of( pe, infos[ 0 ].src, props_off ) )
+            return false;
+        if ( static_cast< std::uint64_t >( props_off ) + k_lzma_props > pe.size )
+            return false;
+
+        props = pe.data + props_off;
+        props_size = infos[ 0 ].dst ? infos[ 0 ].dst : k_lzma_props;
+        if ( static_cast< std::uint64_t >( props_off ) + props_size > pe.size )
+            return false;
+
+        infos.erase( infos.begin( ) );
+        if ( infos.empty( ) )
+            return false;
+
+        for ( const auto& e : infos )
+        {
+            std::uint32_t raw = 0;
+            if ( !block_raw( pe, e.src, raw ) )
+                return false;
+            if ( !probe_lzma( props, props_size, pe.data + raw, pe.size - raw ) )
+                return false;
+        }
+
+        return true;
+    }
+
+    auto find_v39( const pe_view& pe, const std::vector< std::uint32_t >& dests, std::vector< packer_info >& infos ) -> bool
+    {
+        const auto n = dests.size( );
+        if ( n < 2 )
+            return false;
+
+        const auto need = n * sizeof( packer_info );
+        const auto spans = raw_spans( pe );
+        for ( const auto& sp : spans )
+        {
+            if ( sp.end - sp.begin < need )
+                continue;
+
+            const auto last = sp.end - need;
+            for ( auto i = sp.begin; i <= last; ++i )
+            {
+                auto plausible = true;
+                for ( std::size_t k = 0; k < n && plausible; ++k )
+                {
+                    const auto src = read_u32( pe.data + i + k * 8 );
+                    std::uint32_t raw = 0;
+                    plausible = src && block_raw( pe, src, raw );
+                }
+                if ( !plausible )
+                    continue;
+
+                const auto stored = read_u32( pe.data + i + 4 );
+                for ( auto seed : dests )
+                {
+                    const auto key = stored ^ seed;
+                    std::vector< packer_info > hit;
+                    hit.reserve( n );
+
+                    auto ok = true;
+                    for ( std::size_t k = 0; k < n && ok; ++k )
+                    {
+                        const auto dst = read_u32( pe.data + i + k * 8 + 4 ) ^ rol32( key, static_cast< unsigned >( 7 * k ) );
+                        if ( !is_dest_va( dests, dst ) )
+                        {
+                            ok = false;
+                            break;
+                        }
+                        for ( const auto& e : hit )
+                        {
+                            if ( e.dst == dst )
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ( !ok )
+                            break;
+
+                        packer_info e{};
+                        e.src = read_u32( pe.data + i + k * 8 );
+                        e.dst = dst;
+                        hit.push_back( e );
+                    }
+                    if ( !ok || hit.size( ) != n )
+                        continue;
+
+                    auto decodes = true;
+                    for ( std::size_t k = 0; k < n && decodes; ++k )
+                    {
+                        std::uint32_t raw = 0;
+                        if ( !block_raw( pe, hit[ k ].src, raw ) )
+                        {
+                            decodes = false;
+                            break;
+                        }
+                        decodes = probe_lzma( k_lzma_props_stock, k_lzma_props, pe.data + raw, pe.size - raw );
+                    }
+                    if ( !decodes )
+                        continue;
+
+                    infos = std::move( hit );
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    auto locate_blocks( const pe_view& pe, const std::vector< std::uint32_t >& dests, std::vector< packer_info >& infos, const std::uint8_t*& props, std::size_t& props_size ) -> bool
+    {
+        if ( find_legacy( pe, dests, infos, props, props_size ) )
+            return true;
+
+        if ( !find_v39( pe, dests, infos ) )
+            return false;
+
+        props = k_lzma_props_stock;
+        props_size = k_lzma_props;
+        return true;
+    }
 }
 
 auto unpack_pe( const std::vector< std::uint8_t >& packed ) -> std::vector< std::uint8_t >
@@ -532,50 +802,6 @@ auto unpack_pe( const std::vector< std::uint8_t >& packed ) -> std::vector< std:
 
     std::vector< std::uint8_t > image( pe.size_of_image );
     std::memcpy( image.data( ), packed.data( ), pe.size_of_headers );
-
-    std::vector< std::uint8_t > rva_pat;
-    rva_pat.reserve( pe.section_count * 8 );
-
-    for ( std::uint32_t i = 0; i < pe.section_count; ++i )
-    {
-        const auto& s = pe.sections[ i ];
-        if ( s.SizeOfRawData )
-            continue;
-        if ( s.PointerToRawData )
-            continue;
-        if ( s.Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA )
-            continue;
-
-        const auto va = s.VirtualAddress;
-        rva_pat.insert( rva_pat.end( ), { 0xFF, 0xFF, 0xFF, 0xFF } );
-        rva_pat.push_back( static_cast< std::uint8_t >( va ) );
-        rva_pat.push_back( static_cast< std::uint8_t >( va >> 8 ) );
-        rva_pat.push_back( static_cast< std::uint8_t >( va >> 16 ) );
-        rva_pat.push_back( static_cast< std::uint8_t >( va >> 24 ) );
-    }
-
-    std::vector< packer_info > infos;
-    if ( !rva_pat.empty( ) )
-    {
-        const auto pos = find_pattern( packed.data( ), packed.size( ), rva_pat.data( ), rva_pat.size( ) );
-        if ( pos < 0 )
-            throw std::runtime_error( "RVA pattern sequence for PACKER_INFO not found in packed PE, but patterns were expected." );
-
-        if ( pos < 8 )
-            throw std::runtime_error( "Located RVA pattern is too close to the beginning of the file to precede PACKER_INFO[0]." );
-
-        const auto n = static_cast< std::size_t >( rva_pat.size( ) / 8 );
-        const auto off = static_cast< std::size_t >( pos ) - 8;
-        if ( off + ( n + 1 ) * sizeof( packer_info ) > packed.size( ) )
-            throw std::runtime_error( "Located PACKER_INFO array extends beyond packed PE buffer or has invalid start." );
-
-        infos.resize( n + 1 );
-        std::memcpy( infos.data( ), packed.data( ) + off, ( n + 1 ) * sizeof( packer_info ) );
-    }
-    else
-    {
-        std::printf( "Warning: RVA pattern array is empty. No PACKER_INFO entries to process for LZMA.\n" );
-    }
 
     for ( std::uint32_t i = 0; i < pe.section_count; ++i )
     {
@@ -610,66 +836,62 @@ auto unpack_pe( const std::vector< std::uint8_t >& packed ) -> std::vector< std:
         }
     }
 
-    if ( infos.size( ) > 1 )
+    const auto dests = packed_dests( pe );
+    if ( dests.empty( ) )
     {
-        const auto& props_info = infos[ 0 ];
-        const auto props_off = rva_to_offset( pe, props_info.src );
-        const auto props_size = props_info.dst;
+        apply_oep( image, find_oep( image, pe.magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC ) );
+        return image;
+    }
 
-        if ( static_cast< std::uint64_t >( props_off ) + props_size > packed.size( ) )
+    std::vector< packer_info > infos;
+    const std::uint8_t* props = nullptr;
+    auto props_size = std::size_t{};
+    if ( !locate_blocks( pe, dests, infos, props, props_size ) )
+        throw std::runtime_error( "PACKER_INFO not found in packed PE." );
+
+    if ( props_size != k_lzma_props )
+    {
+        std::printf(
+            "Warning: LZMA properties size is %zu. Standard is %u. Using provided size.\n",
+            props_size,
+            k_lzma_props );
+    }
+
+    for ( std::size_t block = 0; block < infos.size( ); ++block )
+    {
+        const auto compressed_rva = infos[ block ].src;
+        const auto target_rva = infos[ block ].dst;
+
+        std::uint32_t raw_off = 0;
+        try
+        {
+            raw_off = rva_to_offset( pe, compressed_rva );
+        }
+        catch ( const std::exception& ex )
+        {
+            throw std::runtime_error( "Block " + std::to_string( block ) + ": Cannot convert RVA to file offset: " + ex.what( ) );
+        }
+
+        if ( raw_off >= packed.size( ) )
+            throw std::runtime_error( "Block " + std::to_string( block ) + ": compressed data offset is past the packed file" );
+
+        if ( target_rva >= pe.size_of_image )
         {
             throw std::runtime_error(
-                "LZMA properties data (RVA " + hex( props_info.src ) + " -> Raw " + hex( props_off ) +
-                ", Size from Dst " + std::to_string( props_size ) + ") extends beyond packed PE size (" +
-                hex( packed.size( ) ) + ")." );
+                "Block " + std::to_string( block ) + ": PACKER_INFO.Dst (decompression target RVA " +
+                hex( target_rva ) + ") exceeds image boundary (" + hex( pe.size_of_image ) + ")." );
         }
 
-        if ( props_size != k_lzma_props )
-        {
-            std::printf(
-                "Warning: PACKER_INFO[0].Dst (LZMA properties size) is %u. Standard is %u. Using provided size.\n",
-                props_size,
-                k_lzma_props );
-        }
+        const auto available = pe.size_of_image - target_rva;
+        auto decoded = lzma_decompress(
+            props,
+            props_size,
+            packed.data( ) + raw_off,
+            packed.size( ) - raw_off,
+            available );
 
-        const auto* props = packed.data( ) + props_off;
-
-        for ( std::size_t block = 1; block < infos.size( ) ; ++block )
-        {
-            const auto compressed_rva = infos[ block ].src;
-            const auto target_rva = infos[ block ].dst;
-
-            std::uint32_t raw_off = 0;
-            try
-            {
-                raw_off = rva_to_offset( pe, compressed_rva );
-            }
-            catch ( const std::exception& ex )
-            {
-                throw std::runtime_error( "Block " + std::to_string( block ) + ": Cannot convert RVA to file offset: " + ex.what( ) );
-            }
-
-            if ( raw_off >= packed.size( ) )
-                throw std::runtime_error( "Block " + std::to_string( block ) + ": compressed data offset is past the packed file" );
-
-            if ( target_rva >= pe.size_of_image )
-            {
-                throw std::runtime_error(
-                    "Block " + std::to_string( block ) + ": PACKER_INFO.Dst (decompression target RVA " +
-                    hex( target_rva ) + ") exceeds image boundary (" + hex( pe.size_of_image ) + ")." );
-            }
-
-            const auto available = pe.size_of_image - target_rva;
-            auto decoded = lzma_decompress(
-                props,
-                props_size,
-                packed.data( ) + raw_off,
-                packed.size( ) - raw_off,
-                available );
-
-            const auto copy = ( std::min )( decoded.size( ), static_cast< std::size_t >( available ) );
-            std::memcpy( image.data( ) + target_rva, decoded.data( ), copy );
-        }
+        const auto copy = ( std::min )( decoded.size( ), static_cast< std::size_t >( available ) );
+        std::memcpy( image.data( ) + target_rva, decoded.data( ), copy );
     }
 
     apply_oep( image, find_oep( image, pe.magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC ) );
