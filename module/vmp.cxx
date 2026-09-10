@@ -274,12 +274,14 @@ namespace
 
     auto is_rel_call( const decoded& d ) -> bool
     {
-        return d.ok && d.mnemonic == ZYDIS_MNEMONIC_CALL && d.len == 5 && d.op_count && d.ops[ 0 ].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+        return d.ok && d.mnemonic == ZYDIS_MNEMONIC_CALL && d.len == 5 &&
+            d.op_count && d.ops[ 0 ].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && d.ops[ 0 ].imm.is_relative;
     }
 
     auto is_rel_jmp( const decoded& d ) -> bool
     {
-        return d.ok && d.mnemonic == ZYDIS_MNEMONIC_JMP && d.len == 5 && d.op_count && d.ops[ 0 ].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+        return d.ok && d.mnemonic == ZYDIS_MNEMONIC_JMP && d.len == 5 &&
+            d.op_count && d.ops[ 0 ].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && d.ops[ 0 ].imm.is_relative;
     }
 
     auto is_near_imm( const decoded& d ) -> bool
@@ -470,7 +472,63 @@ namespace
                 pending.push_back( next );
             }
         }
-        std::sort( out.begin( ), out.end( ), [ ]( const xfer& a, const xfer& b ) { return a.rva < b.rva; } );
+        for ( const auto& s : secs )
+        {
+            if ( !( s.ch & IMAGE_SCN_MEM_EXECUTE ) || s.vm || !s.span )
+                continue;
+            if ( s.ch & IMAGE_SCN_MEM_WRITE )
+                continue;
+            for ( auto rva = s.va; rva + 5 <= s.va + s.span && rva + 5 <= img.bytes.size( ); ++rva )
+            {
+                const auto d = decode_at( img, rva );
+                if ( !( is_rel_call( d ) || is_rel_jmp( d ) ) || !d.has_abs0 || d.abs0 < img.base )
+                    continue;
+                const auto stub = static_cast< std::uint32_t >( d.abs0 - img.base );
+                if ( !in_vm( secs, stub ) )
+                    continue;
+                xfer x{};
+                x.jmp = is_rel_jmp( d );
+                x.rva = rva;
+                x.len = d.len;
+                x.stub = stub;
+                x.has_ret = !x.jmp;
+                x.ret = x.has_ret ? rva + d.len : 0;
+                out.push_back( x );
+            }
+        }
+        std::sort( out.begin( ), out.end( ), [ ]( const xfer& a, const xfer& b )
+        {
+            if ( a.rva != b.rva )
+                return a.rva < b.rva;
+            return a.len > b.len;
+        } );
+        out.erase( std::unique( out.begin( ), out.end( ),
+            [ ]( const xfer& a, const xfer& b ) { return a.rva == b.rva && a.stub == b.stub; } ), out.end( ) );
+        std::vector< xfer > unique_xfers;
+        unique_xfers.reserve( out.size( ) );
+        for ( const auto& x : out )
+        {
+            auto overlap = false;
+            for ( auto& y : unique_xfers )
+            {
+                if ( y.stub != x.stub )
+                    continue;
+                if ( x.rva > y.rva && x.rva < y.rva + y.len )
+                {
+                    if ( x.len == 5 && y.len != 5 && x.rva - y.rva <= 2 )
+                    {
+                        y = x;
+                        overlap = true;
+                        break;
+                    }
+                    overlap = true;
+                    break;
+                }
+            }
+            if ( !overlap )
+                unique_xfers.push_back( x );
+        }
+        out.swap( unique_xfers );
         return out;
     }
 
@@ -531,13 +589,15 @@ namespace
     auto looks_like_vm_enter( const runtime_image& img, std::uint32_t rva ) -> bool
     {
         const auto a = decode_at( img, rva );
-        if ( !a.ok || a.mnemonic != ZYDIS_MNEMONIC_PUSH )
+        if ( !a.ok || a.mnemonic != ZYDIS_MNEMONIC_PUSH || !a.op_count || a.ops[ 0 ].type != ZYDIS_OPERAND_TYPE_IMMEDIATE )
             return false;
         const auto b = decode_at( img, rva + a.len );
         if ( !b.ok )
             return false;
         if ( b.mnemonic == ZYDIS_MNEMONIC_PUSH )
         {
+            if ( !b.op_count || b.ops[ 0 ].type != ZYDIS_OPERAND_TYPE_IMMEDIATE )
+                return false;
             const auto c = decode_at( img, rva + a.len + b.len );
             return c.ok && ( c.mnemonic == ZYDIS_MNEMONIC_JMP || c.mnemonic == ZYDIS_MNEMONIC_CALL || c.mnemonic == ZYDIS_MNEMONIC_RET );
         }
@@ -546,7 +606,18 @@ namespace
 
     auto classify_stop( const runtime_image& img, const std::vector< vsec >& secs, const xfer& x, const emu_stop& stop, vm_stub& st ) -> bool
     {
-        if ( stop.kind == emu_stop_kind::limit || stop.kind == emu_stop_kind::unmapped )
+        auto kind = stop.kind;
+        auto dest = stop.dest;
+        if ( kind == emu_stop_kind::unmapped )
+        {
+            const auto maybe = dest ? dest : stop.insn_addr;
+            if ( pick_export( img, maybe ) )
+            {
+                kind = emu_stop_kind::external;
+                dest = maybe;
+            }
+        }
+        if ( kind == emu_stop_kind::limit || kind == emu_stop_kind::unmapped )
             return false;
         if ( stop.insns > k_max_stub_insns )
             return false;
@@ -554,9 +625,9 @@ namespace
             return false;
 
         const auto w = img.is64 ? 8 : 4;
-        if ( stop.kind == emu_stop_kind::external )
+        if ( kind == emu_stop_kind::external )
         {
-            const auto* exp = pick_export( img, stop.dest );
+            const auto* exp = pick_export( img, dest );
             if ( !exp )
                 return false;
             auto has_resume = false;
@@ -574,13 +645,16 @@ namespace
                 if ( dlt % static_cast< std::size_t >( w ) )
                     return false;
                 if ( !( x.jmp || dlt >= static_cast< std::size_t >( w ) ) )
-                    return false;
+                {
+                    resume = x.ret;
+                    has_resume = true;
+                }
             }
             else
             {
                 return false;
             }
-            st.dest = stop.dest;
+            st.dest = dest;
             st.module = exp->module;
             st.name = exp->name;
             st.ordinal = exp->ordinal;
@@ -736,29 +810,83 @@ auto recover_vm_stubs( const runtime_image& img ) -> std::vector< vm_stub >
 
     stub_emulator emu( img.is64, img.base, img.bytes );
     const auto xfers = find_xfers( img, secs );
-    std::map< std::uint32_t, std::uint32_t > stub_uses;
-    for ( const auto& x : xfers )
-        ++stub_uses[ x.stub ];
+    std::map< std::uint32_t, emu_stop > stops;
+    std::set< std::uint32_t > failed;
     for ( const auto& x : xfers )
     {
-        if ( stub_uses[ x.stub ] >= 2 )
-            continue;
         if ( looks_like_vm_enter( img, x.stub ) )
             continue;
         emu_stop stop{};
-        try
-        {
-            stop = emu.emulate( img.base + x.stub, x.has_ret, img.base + x.ret, k_stub_limit );
-        }
-        catch ( ... )
-        {
+        if ( failed.count( x.stub ) )
             continue;
+        auto it = stops.find( x.stub );
+        if ( it != stops.end( ) )
+        {
+            stop = it->second;
+        }
+        else
+        {
+            try
+            {
+                stop = emu.emulate( img.base + x.stub, x.has_ret, img.base + x.ret, k_stub_limit );
+                stops.emplace( x.stub, stop );
+            }
+            catch ( ... )
+            {
+                failed.insert( x.stub );
+                continue;
+            }
         }
         vm_stub st{};
         if ( !classify_stop( img, secs, x, stop, st ) )
             continue;
         if ( !st.len || st.rva >= img.bytes.size( ) || static_cast< std::size_t >( st.rva ) + st.len > img.bytes.size( ) )
             continue;
+        if ( ( st.type == k_vm_call || st.type == k_vm_jmp ) && st.len == 5 &&
+            static_cast< std::size_t >( st.rva ) + 6 <= img.bytes.size( ) )
+        {
+            const auto push = push_rva( img, st.rva );
+            if ( push != st.rva && st.rva - push <= 2 &&
+                static_cast< std::size_t >( push ) + 6 <= img.bytes.size( ) )
+            {
+                auto occupied = false;
+                for ( const auto& prev : out )
+                {
+                    if ( prev.rva < push + 6 && prev.rva + prev.len > push )
+                        occupied = true;
+                }
+                for ( const auto& other : xfers )
+                {
+                    if ( other.rva > push && other.rva < push + 6 && other.rva != st.rva && other.rva != st.rva + st.len )
+                        occupied = true;
+                }
+                if ( !occupied )
+                {
+                    st.rva = push;
+                    st.len = 6;
+                }
+            }
+        }
+        if ( ( st.type == k_vm_call || st.type == k_vm_jmp ) && st.len < 6 &&
+            static_cast< std::size_t >( st.rva ) + 6 <= img.bytes.size( ) )
+        {
+            auto occupied = false;
+            for ( const auto& prev : out )
+            {
+                if ( prev.rva < st.rva + 6 && prev.rva + prev.len > st.rva )
+                    occupied = true;
+            }
+            for ( const auto& other : xfers )
+            {
+                if ( other.rva > st.rva && other.rva < st.rva + 6 && other.rva != st.rva + st.len )
+                    occupied = true;
+            }
+            if ( !occupied )
+                st.len = 6;
+        }
+        if ( ( st.type == k_vm_call || st.type == k_vm_jmp ) && st.resume &&
+            st.resume > st.rva && st.resume < st.rva + st.len )
+            st.resume = st.rva + st.len;
         out.push_back( std::move( st ) );
     }
     return out;
@@ -778,11 +906,18 @@ auto count_vm_stubs( const runtime_image& img ) -> std::size_t
 
 auto apply_vm_stubs( runtime_image& img, const std::vector< vm_stub >& stubs, const std::map< std::uint64_t, std::uint32_t >& dest_to_iat ) -> void
 {
-    for ( const auto& st : stubs )
+    for ( auto st : stubs )
     {
         const auto it = dest_to_iat.find( st.dest );
         if ( it == dest_to_iat.end( ) )
             continue;
+        if ( ( st.type == k_vm_call || st.type == k_vm_jmp ) && img.is64 && st.len && st.len < 6 &&
+            static_cast< std::size_t >( st.rva ) + 6 <= img.bytes.size( ) &&
+            ( !st.resume || ( st.resume >= st.rva && st.resume <= st.rva + 6 ) ) )
+        {
+            st.len = 6;
+            st.resume = st.rva + 6;
+        }
         if ( !st.len || static_cast< std::size_t >( st.rva ) + st.len > img.bytes.size( ) )
             continue;
         const auto slot_va = img.base + it->second;
@@ -828,7 +963,8 @@ auto apply_vm_stubs( runtime_image& img, const std::vector< vm_stub >& stubs, co
         }
         if ( bytes.empty( ) || bytes.size( ) > st.len )
             continue;
-        if ( st.resume && st.resume != st.rva + static_cast< std::uint32_t >( bytes.size( ) ) )
+        if ( st.resume && st.resume != st.rva + static_cast< std::uint32_t >( bytes.size( ) ) &&
+            !( st.resume > st.rva && st.resume < st.rva + st.len ) )
         {
             const auto remain = static_cast< std::size_t >( st.len ) - bytes.size( );
             auto jmp = encode_rel_jmp( st.rva + static_cast< std::uint32_t >( bytes.size( ) ), st.resume, remain );
@@ -838,6 +974,8 @@ auto apply_vm_stubs( runtime_image& img, const std::vector< vm_stub >& stubs, co
             if ( bytes.size( ) > st.len )
                 continue;
         }
+        if ( bytes.size( ) < st.len )
+            bytes.resize( st.len, 0x90 );
         std::memcpy( img.bytes.data( ) + st.rva, bytes.data( ), bytes.size( ) );
     }
 }

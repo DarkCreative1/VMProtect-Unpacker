@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -468,22 +469,8 @@ auto rebuild_iat( runtime_image& img ) -> std::vector< std::uint8_t >
             uniq[ key ] = rec;
     };
 
-    if ( !refs.empty( ) )
-    {
-        for ( const auto& r : refs )
-        {
-            for ( const auto& pt : pointers )
-            {
-                if ( pt.imp.dest == r.dest )
-                    add_imp( pt.imp );
-            }
-        }
-    }
-    else
-    {
-        for ( const auto& pt : pointers )
-            add_imp( pt.imp );
-    }
+    for ( const auto& pt : pointers )
+        add_imp( pt.imp );
     for ( const auto& st : stubs )
     {
         recovered rec{};
@@ -493,6 +480,11 @@ auto rebuild_iat( runtime_image& img ) -> std::vector< std::uint8_t >
         rec.dest = st.dest;
         add_imp( rec );
     }
+
+    std::printf( "iat: pointers=%zu stubs=%zu names=%zu\n", pointers.size( ), stubs.size( ), uniq.size( ) );
+    for ( const auto& kv : uniq )
+        std::printf( "  %s!%s\n", kv.second.module.c_str( ), kv.second.name.empty( ) ? "<ordinal>" : kv.second.name.c_str( ) );
+    std::fflush( stdout );
 
     std::map< std::string, std::vector< recovered > > by_mod;
     for ( auto& kv : uniq )

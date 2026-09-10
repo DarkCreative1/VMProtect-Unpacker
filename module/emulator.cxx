@@ -220,14 +220,27 @@ auto stub_emulator::emulate( std::uint64_t stub, bool has_ret, std::uint64_t ret
 
     err = uc_emu_start( uc, stub, 0, 0, limit );
     emu_stop out{};
+    if ( err == UC_ERR_FETCH_UNMAPPED )
+    {
+        const auto rip = read_u64( uc, is64_ ? UC_X86_REG_RIP : UC_X86_REG_EIP );
+        if ( !inside( &mon, rip ) )
+        {
+            mon.kind = emu_stop_kind::external;
+            mon.dest = rip;
+            mon.stopped = true;
+        }
+        err = UC_ERR_OK;
+    }
     if ( mon.stopped )
     {
         out.kind = mon.kind;
         out.dest = mon.dest;
         out.ret_addr = mon.ret_addr;
         out.insns = mon.insns;
-        if ( mon.kind == emu_stop_kind::external )
+        if ( mon.kind == emu_stop_kind::external || mon.kind == emu_stop_kind::unmapped )
         {
+            if ( !out.dest )
+                out.dest = mon.mem_addr ? mon.mem_addr : read_u64( uc, is64_ ? UC_X86_REG_RIP : UC_X86_REG_EIP );
             const auto final_sp = read_u64( uc, is64_ ? UC_X86_REG_RSP : UC_X86_REG_ESP );
             out.sp_delta = static_cast< std::int64_t >( final_sp ) - static_cast< std::int64_t >( sp );
             if ( is64_ )
@@ -242,6 +255,8 @@ auto stub_emulator::emulate( std::uint64_t stub, bool has_ret, std::uint64_t ret
                 if ( uc_mem_read( uc, final_sp, &v, 4 ) == UC_ERR_OK )
                     out.ext_ret = v;
             }
+            if ( mon.kind == emu_stop_kind::unmapped )
+                out.insn_addr = mon.mem_addr;
         }
         else if ( mon.kind == emu_stop_kind::returned )
         {
