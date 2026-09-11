@@ -1,5 +1,8 @@
 #include "module/decompression.hxx"
 #include "module/decompression2.hxx"
+#include "module/lifter.hxx"
+
+#include "module/static_iat.hxx"
 
 #include <cstdio>
 #include <cstdlib>
@@ -49,7 +52,12 @@ auto parse_u32_opt( int argc, char** argv, const char* name, std::uint32_t fallb
 auto main( int argc, char** argv ) -> int
 {
     auto runtime = false;
+    auto decompress_only = false;
+    auto lift = false;
+    auto strip_vmp = false;
     auto pid = 0u;
+    auto vmenter = 0ull;
+    auto max_ops = 256ull;
     const char* module_name = nullptr;
     std::vector< const char* > pos;
     for ( int i = 1; i < argc; ++i )
@@ -59,7 +67,24 @@ auto main( int argc, char** argv ) -> int
             runtime = true;
             continue;
         }
-        if ( !std::strcmp( argv[ i ], "--wait" ) || !std::strcmp( argv[ i ], "--pid" ) || !std::strcmp( argv[ i ], "--module" ) )
+        if ( !std::strcmp( argv[ i ], "--decompress-only" ) )
+        {
+            decompress_only = true;
+            continue;
+        }
+        if ( !std::strcmp( argv[ i ], "--lift" ) )
+        {
+            lift = true;
+            continue;
+        }
+        if ( !std::strcmp( argv[ i ], "--strip-vmp" ) )
+        {
+            strip_vmp = true;
+            continue;
+        }
+        if ( !std::strcmp( argv[ i ], "--wait" ) || !std::strcmp( argv[ i ], "--pid" ) ||
+            !std::strcmp( argv[ i ], "--module" ) || !std::strcmp( argv[ i ], "--vmenter" ) ||
+            !std::strcmp( argv[ i ], "--max-ops" ) )
         {
             if ( i + 1 < argc )
             {
@@ -67,6 +92,10 @@ auto main( int argc, char** argv ) -> int
                     pid = static_cast< std::uint32_t >( std::strtoul( argv[ i + 1 ], nullptr, 10 ) );
                 else if ( !std::strcmp( argv[ i ], "--module" ) )
                     module_name = argv[ i + 1 ];
+                else if ( !std::strcmp( argv[ i ], "--vmenter" ) )
+                    vmenter = std::strtoull( argv[ i + 1 ], nullptr, 0 );
+                else if ( !std::strcmp( argv[ i ], "--max-ops" ) )
+                    max_ops = std::strtoull( argv[ i + 1 ], nullptr, 0 );
                 ++i;
             }
             continue;
@@ -74,10 +103,12 @@ auto main( int argc, char** argv ) -> int
         pos.push_back( argv[ i ] );
     }
 
-    if ( ( pid && pos.size( ) < 1 ) || ( !pid && pos.size( ) < 2 ) )
+    if ( ( pid && pos.size( ) < 1 ) || ( lift && pos.size( ) < 1 ) || ( !pid && !lift && pos.size( ) < 2 ) )
     {
-        std::printf( "usage: %s [--runtime] [--wait ms] <in> <out>\n", argv[ 0 ] );
-        std::printf( "       %s --pid <pid> [--module name] <out>\n", argv[ 0 ] );
+        std::printf( "usage: %s [--decompress-only] [--strip-vmp] <in> <out>\n", argv[ 0 ] );
+        std::printf( "       %s --runtime [--wait ms] [--strip-vmp] <in> <out>\n", argv[ 0 ] );
+        std::printf( "       %s --pid <pid> [--module name] [--strip-vmp] <out>\n", argv[ 0 ] );
+        std::printf( "       %s --lift [--vmenter va] [--max-ops n] <in> [outdir]\n", argv[ 0 ] );
         return 1;
     }
 
@@ -85,7 +116,7 @@ auto main( int argc, char** argv ) -> int
     {
         if ( pid )
         {
-            const auto dumped = dump_pid_and_fix( pid, module_name );
+            const auto dumped = dump_pid_and_fix( pid, module_name, strip_vmp );
             write_file( pos[ 0 ], dumped );
             std::printf( "dumped %zu bytes\n", dumped.size( ) );
             return 0;
@@ -94,9 +125,38 @@ auto main( int argc, char** argv ) -> int
         if ( runtime )
         {
             const auto wait_ms = parse_u32_opt( argc, argv, "--wait", 15000 );
-            const auto dumped = dump_and_fix( pos[ 0 ], wait_ms );
+            const auto dumped = dump_and_fix( pos[ 0 ], wait_ms, strip_vmp );
             write_file( pos[ 1 ], dumped );
             std::printf( "dumped %zu bytes\n", dumped.size( ) );
+            return 0;
+        }
+
+        if ( lift )
+        {
+            const auto file = read_file( pos[ 0 ] );
+            const auto report = lift_vm( file, vmenter, static_cast< std::size_t >( max_ops ) );
+            const auto dir = pos.size( ) >= 2 ? std::string( pos[ 1 ] ) : ( std::string( pos[ 0 ] ) + ".lift" );
+            write_lift_report( dir, report );
+            std::printf( "%s\n", report.summary.c_str( ) );
+            std::printf( "wrote lift report to %s\n", dir.c_str( ) );
+            const auto n = report.vmenters.size( ) < 16 ? report.vmenters.size( ) : 16;
+            for ( std::size_t i = 0; i < n; ++i )
+            {
+                const auto& s = report.vmenters[ i ];
+                const char* kind = "pushfq";
+                if ( s.kind == vmenter_kind::push_imm )
+                    kind = "push_imm";
+                else if ( s.kind == vmenter_kind::push_call )
+                    kind = "push_call";
+                else if ( s.kind == vmenter_kind::pdata )
+                    kind = "pdata";
+                std::printf( "  %-8s va=0x%llx rva=0x%x score=%d %s\n",
+                    kind,
+                    static_cast< unsigned long long >( s.va ),
+                    s.rva,
+                    s.score,
+                    s.note.c_str( ) );
+            }
             return 0;
         }
 
@@ -108,8 +168,26 @@ auto main( int argc, char** argv ) -> int
             return 1;
         }
 
-        write_file( pos[ 1 ], unpacked );
-        std::printf( "unpacked %zu bytes\n", unpacked.size( ) );
+        if ( decompress_only )
+        {
+            write_file( pos[ 1 ], unpacked );
+            std::printf( "decompressed %zu bytes (IAT recovery skipped)\n", unpacked.size( ) );
+            return 0;
+        }
+
+        try
+        {
+            const auto wait_ms = parse_u32_opt( argc, argv, "--wait", 180000 );
+            auto image = initialize_static_imports( packed, unpacked, wait_ms );
+            auto fixed = rebuild_iat( image, strip_vmp );
+            write_file( pos[ 1 ], fixed );
+            std::printf( "unpacked and rebuilt IAT, %zu bytes\n", fixed.size( ) );
+        }
+        catch ( const std::exception& ex )
+        {
+            throw std::runtime_error( std::string( "offline IAT recovery failed: " ) + ex.what( ) +
+                "; use --decompress-only to save the decompressed image or --runtime for live recovery" );
+        }
         return 0;
     }
     catch ( const std::exception& ex )
