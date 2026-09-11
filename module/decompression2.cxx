@@ -399,10 +399,10 @@ auto dump_runtime( const char* packed_path, std::uint32_t wait_ms ) -> runtime_i
     return best;
 }
 
-auto dump_and_fix( const char* packed_path, std::uint32_t wait_ms ) -> std::vector< std::uint8_t >
+auto dump_and_fix( const char* packed_path, std::uint32_t wait_ms, bool strip_vmp ) -> std::vector< std::uint8_t >
 {
     auto img = dump_runtime( packed_path, wait_ms );
-    return rebuild_iat( img );
+    return rebuild_iat( img, strip_vmp );
 }
 
 auto dump_pid( std::uint32_t pid, const char* module_name ) -> runtime_image
@@ -417,8 +417,8 @@ auto dump_pid( std::uint32_t pid, const char* module_name ) -> runtime_image
     return img;
 }
 
-auto dump_pid_and_fix( std::uint32_t pid, const char* module_name ) -> std::vector< std::uint8_t >
+auto dump_pid_and_fix( std::uint32_t pid, const char* module_name, bool strip_vmp ) -> std::vector< std::uint8_t >
 {
     auto img = dump_pid( pid, module_name );
-    return rebuild_iat( img );
+    return rebuild_iat( img, strip_vmp );
 }

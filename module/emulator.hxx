@@ -33,7 +33,10 @@ class stub_emulator
 {
 public:
     stub_emulator( bool is64, std::uint64_t base, std::vector< std::uint8_t > snap );
-    auto emulate( std::uint64_t stub, bool has_ret, std::uint64_t ret, std::size_t limit ) const -> emu_stop;
+    stub_emulator( const stub_emulator& ) = delete;
+    auto operator=( const stub_emulator& ) -> stub_emulator& = delete;
+    ~stub_emulator( );
+    auto emulate( std::uint64_t stub, bool has_ret, std::uint64_t ret, std::size_t limit ) -> emu_stop;
 
 private:
     bool is64_;
@@ -41,4 +44,6 @@ private:
     std::uint64_t end_;
     std::uint64_t mapped_;
     std::vector< std::uint8_t > snap_;
+    void* uc_;
 };
+

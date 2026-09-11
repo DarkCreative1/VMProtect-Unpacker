@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winternl.h>
 #include <intrin.h>
 #include <unicorn/unicorn.h>
 #include <Zydis/Zydis.h>
@@ -53,6 +54,131 @@ namespace
             s += c;
         }
         throw std::runtime_error( "unterminated PE string" );
+    }
+    auto dll_basename( std::string name ) -> std::string
+    {
+        name = lower( std::move( name ) );
+        auto slash = name.find_last_of( "\\/" );
+        if ( slash != std::string::npos ) name.erase( 0, slash + 1 );
+        if ( name.size( ) >= 4 && name.compare( name.size( ) - 4, 4, ".dll" ) == 0 )
+            name.erase( name.size( ) - 4 );
+        return name;
+    }
+    auto is_api_set_name( const std::string& name ) -> bool
+    {
+        return name.rfind( "api-ms-", 0 ) == 0 || name.rfind( "ext-ms-", 0 ) == 0;
+    }
+    auto host_api_set_map( ) -> const bytes&
+    {
+        static bytes map;
+        static bool ready = false;
+        if ( ready ) return map;
+        PROCESS_BASIC_INFORMATION pbi{};
+        ULONG ret{};
+        using query_fn = LONG( WINAPI* )( HANDLE, ULONG, PVOID, ULONG, PULONG );
+        auto query = reinterpret_cast< query_fn >( GetProcAddress( GetModuleHandleW( L"ntdll.dll" ), "NtQueryInformationProcess" ) );
+        require( query && query( GetCurrentProcess( ), 0, &pbi, sizeof( pbi ), &ret ) == 0 && pbi.PebBaseAddress, "cannot locate host PEB" );
+        auto* host_peb = reinterpret_cast< const std::uint8_t* >( pbi.PebBaseAddress );
+        std::uint64_t map_va{};
+        std::memcpy( &map_va, host_peb + 0x68, sizeof( map_va ) );
+        require( map_va, "host ApiSetMap is missing" );
+        auto* hdr = reinterpret_cast< const std::uint32_t* >( static_cast< std::uintptr_t >( map_va ) );
+        require( hdr[ 0 ] >= 6 && hdr[ 1 ] >= 28 && hdr[ 1 ] <= 2u * 1024 * 1024, "unsupported host ApiSetMap" );
+        map.assign( reinterpret_cast< const std::uint8_t* >( map_va ), reinterpret_cast< const std::uint8_t* >( map_va ) + hdr[ 1 ] );
+        ready = true;
+        return map;
+    }
+    auto utf16_ascii( const bytes& b, std::uint32_t off, std::uint32_t len ) -> std::string
+    {
+        require( !( len & 1 ) && fits( b.size( ), off, len ), "truncated ApiSetMap string" );
+        std::string s;
+        s.reserve( len / 2 );
+        for ( std::uint32_t i = 0; i < len; i += 2 )
+        {
+            auto c = get< std::uint16_t >( b, off + i );
+            require( c && c < 128, "unsupported ApiSetMap character" );
+            s += static_cast< char >( c );
+        }
+        return lower( s );
+    }
+    auto api_set_hash( const std::string& name, std::uint32_t factor ) -> std::uint32_t
+    {
+        std::uint32_t h = 0;
+        for ( unsigned char c : name )
+            h = h * factor + c;
+        return h;
+    }
+    auto lookup_api_set( const std::string& requested ) -> std::string
+    {
+        auto name = dll_basename( requested );
+        if ( !is_api_set_name( name ) ) return {};
+        const auto& map = host_api_set_map( );
+        auto version = get< std::uint32_t >( map, 0 );
+        auto count = get< std::uint32_t >( map, 12 );
+        auto entry_off = get< std::uint32_t >( map, 16 );
+        auto hash_off = get< std::uint32_t >( map, 20 );
+        auto factor = get< std::uint32_t >( map, 24 );
+        require( version >= 6 && count && count <= 4096 && fits( map.size( ), hash_off, count * 8ull ) &&
+            fits( map.size( ), entry_off, count * 24ull ), "invalid host ApiSetMap" );
+        auto hyphen = name.rfind( '-' );
+        auto key = hyphen == std::string::npos ? name : name.substr( 0, hyphen );
+        auto hash = api_set_hash( key, factor );
+        std::int32_t lo = 0, hi = static_cast< std::int32_t >( count ) - 1, idx = -1;
+        while ( lo <= hi )
+        {
+            auto mid = lo + ( hi - lo ) / 2;
+            auto h = get< std::uint32_t >( map, hash_off + static_cast< std::uint64_t >( mid ) * 8 );
+            if ( h < hash ) lo = mid + 1;
+            else if ( h > hash ) hi = mid - 1;
+            else { idx = static_cast< std::int32_t >( get< std::uint32_t >( map, hash_off + static_cast< std::uint64_t >( mid ) * 8 + 4 ) ); break; }
+        }
+        if ( idx < 0 )
+        {
+            for ( std::uint32_t i = 0; i < count; ++i )
+            {
+                auto name_off = get< std::uint32_t >( map, entry_off + i * 24ull + 4 );
+                auto hashed_len = get< std::uint32_t >( map, entry_off + i * 24ull + 12 );
+                if ( utf16_ascii( map, name_off, hashed_len ) == key ) { idx = static_cast< std::int32_t >( i ); break; }
+            }
+        }
+        require( idx >= 0 && static_cast< std::uint32_t >( idx ) < count, ( "unknown API set " + requested ).c_str( ) );
+        auto rec = entry_off + static_cast< std::uint64_t >( idx ) * 24;
+        auto name_off = get< std::uint32_t >( map, rec + 4 );
+        auto hashed_len = get< std::uint32_t >( map, rec + 12 );
+        require( utf16_ascii( map, name_off, hashed_len ) == key, ( "API set hash collision for " + requested ).c_str( ) );
+        auto value_off = get< std::uint32_t >( map, rec + 16 );
+        auto value_count = get< std::uint32_t >( map, rec + 20 );
+        require( value_count && fits( map.size( ), value_off, value_count * 20ull ), "empty API set host list" );
+        auto host_off = get< std::uint32_t >( map, value_off + 12 );
+        auto host_len = get< std::uint32_t >( map, value_off + 16 );
+        auto host = utf16_ascii( map, host_off, host_len );
+        require( !host.empty( ), "empty API set host" );
+        if ( host.find( '.' ) == std::string::npos ) host += ".dll";
+        return host;
+    }
+    auto fallback_api_set_host( const std::string& requested ) -> std::string
+    {
+        auto name = dll_basename( requested );
+        if ( name.find( "-crt-" ) != std::string::npos ) return "ucrtbase.dll";
+        if ( name.find( "-core-com" ) != std::string::npos || name.find( "-downlevel-ole32" ) != std::string::npos )
+            return "combase.dll";
+        if ( name.find( "-ole32" ) != std::string::npos ) return "ole32.dll";
+        return "kernelbase.dll";
+    }
+    auto resolve_module_name( std::string name ) -> std::string
+    {
+        name = lower( std::move( name ) );
+        auto slash = name.find_last_of( "\\/" );
+        if ( slash != std::string::npos ) name.erase( 0, slash + 1 );
+        require( !name.empty( ) && name.find_first_of( "/\\:" ) == std::string::npos && name.find( ".." ) == std::string::npos,
+            "guest DLL path is not a basename" );
+        if ( name.find( '.' ) == std::string::npos ) name += ".dll";
+        if ( !is_api_set_name( name ) ) return name;
+        try { return lookup_api_set( name ); }
+        catch ( const std::exception& )
+        {
+            return fallback_api_set_host( name );
+        }
     }
     auto crc32_ieee( std::uint32_t crc, const std::uint8_t* p, std::size_t n ) -> std::uint32_t
     {
@@ -271,11 +397,7 @@ namespace
         }
         auto load( std::string name ) -> std::uint64_t
         {
-            name = lower( name );
-            require( !name.empty( ) && name.find_first_of( "/\\:" ) == std::string::npos && name.find( ".." ) == std::string::npos, "guest DLL path is not a basename" );
-            if ( name.find( '.' ) == std::string::npos ) name += ".dll";
-            if ( name.rfind( "api-ms-", 0 ) == 0 || name.rfind( "ext-ms-", 0 ) == 0 )
-                name = name.find( "-crt-" ) != std::string::npos ? "ucrtbase.dll" : "kernelbase.dll";
+            name = resolve_module_name( std::move( name ) );
             auto old = dlls.find( name ); if ( old != dlls.end( ) ) return old->second.base;
             require( dlls.size( ) < 64, "offline DLL limit exceeded" );
             char sysdir[ MAX_PATH ]; require( GetSystemDirectoryA( sysdir, MAX_PATH ) < MAX_PATH, "cannot locate System32" );
@@ -478,12 +600,7 @@ namespace
         if ( n == "GetModuleHandleA" || n == "GetModuleHandleW" )
         {
             if ( !a0 ) { result( p.base ); return; }
-            auto name = lower( text( a0, n == "GetModuleHandleW" ) );
-            auto slash = name.find_last_of( "\\/" );
-            if ( slash != std::string::npos ) name.erase( 0, slash + 1 );
-            if ( name.find( '.' ) == std::string::npos ) name += ".dll";
-            if ( name.rfind( "api-ms-", 0 ) == 0 || name.rfind( "ext-ms-", 0 ) == 0 )
-                name = name.find( "-crt-" ) != std::string::npos ? "ucrtbase.dll" : "kernelbase.dll";
+            auto name = resolve_module_name( text( a0, n == "GetModuleHandleW" ) );
             auto found = dlls.find( name );
             std::printf( "offline: module lookup %s -> 0x%llx\n", name.c_str( ),
                 static_cast< unsigned long long >( found == dlls.end( ) ? 0 : found->second.base ) );
@@ -706,6 +823,29 @@ namespace
                 oep = restored_entry; done = true; check( uc_emu_stop( vm.uc ) ); return;
             }
             throw std::runtime_error( "the protected loader requested process termination" );
+        }
+
+        if ( n == "CoInitialize" || n == "CoInitializeEx" )
+        {
+            result( 0 ); return;
+        }
+        if ( n == "CoUninitialize" )
+        {
+            result( 0 ); return;
+        }
+        if ( n == "CoTaskMemAlloc" )
+        {
+            result( allocate( ( std::max )( std::uint64_t( 1 ), a0 ) ) ); return;
+        }
+        if ( n == "CoTaskMemFree" )
+        {
+            result( 0 ); return;
+        }
+        if ( n == "CoCreateInstance" || n == "CoCreateInstanceEx" || n == "CoGetClassObject" )
+        {
+            const auto out = n == "CoCreateInstance" ? argument( 4 ) : ( n == "CoGetClassObject" ? argument( 4 ) : a3 );
+            if ( out && accessible( out, 8 ) ) w64( out, 0 );
+            result( 0x80004001ull ); return;
         }
 
         throw std::runtime_error( "unsupported offline API " + n );

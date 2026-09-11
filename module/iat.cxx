@@ -145,6 +145,7 @@ namespace
     {
         char name[ 9 ];
         std::uint32_t va;
+        std::uint32_t src;
         std::uint32_t vsize;
         std::uint32_t raw;
         std::uint32_t raw_size;
@@ -164,6 +165,7 @@ namespace
             std::memcpy( s.name, img.data( ) + off, 8 );
             s.vsize = read_u32( img.data( ) + off + 8 );
             s.va = read_u32( img.data( ) + off + 12 );
+            s.src = s.va;
             s.raw_size = read_u32( img.data( ) + off + 16 );
             s.raw = read_u32( img.data( ) + off + 20 );
             s.ch = read_u32( img.data( ) + off + 36 );
@@ -175,6 +177,83 @@ namespace
     auto mapped( const sec& s ) -> std::uint32_t
     {
         return ( std::max )( s.vsize, s.raw_size );
+    }
+
+    auto keep_unpacked_section( const sec& s ) -> bool
+    {
+        if ( is_vm_section_name( s.name ) )
+            return false;
+
+        const auto n = lower_copy( s.name );
+        static constexpr const char* k_keep[ ] = {
+            ".text", ".rdata", ".data", ".pdata", ".rsrc", ".reloc", ".bss",
+            ".edata", ".idata", ".didat", ".tls", ".crt", ".gfids", ".00cfg",
+            ".xdata", ".rodata", ".itext", ".debug", ".sxdata", ".buildid",
+            ".ndata", ".udata", ".mrdata", ".code", ".textbss", ".gehcont",
+            ".retplne", ".feat", ".voltbl"
+        };
+        for ( const auto* p : k_keep )
+        {
+            const auto len = std::strlen( p );
+            if ( n.size( ) >= len && n.compare( 0, len, p ) == 0 )
+                return true;
+        }
+        if ( n == "init" || n == "page" || n.rfind( "page", 0 ) == 0 )
+            return true;
+        return mapped( s ) && mapped( s ) < 0x10000;
+    }
+
+    auto rva_in_sections( std::uint32_t rva, const std::vector< sec >& secs ) -> bool
+    {
+        for ( const auto& s : secs )
+        {
+            const auto span = mapped( s );
+            if ( span && rva >= s.va && rva < s.va + span )
+                return true;
+        }
+        return false;
+    }
+
+    auto rebase_resources( std::uint8_t* base, std::uint32_t size, std::int32_t delta ) -> void
+    {
+        if ( !base || !size || !delta )
+            return;
+
+        const auto walk = [ & ]( auto&& self, std::uint32_t off, int depth ) -> void
+        {
+            if ( depth > 16 || off + 16 > size )
+                return;
+            const auto named = read_u16( base + off + 12 );
+            const auto ids = read_u16( base + off + 14 );
+            const auto n = static_cast< std::uint32_t >( named ) + ids;
+            auto ent = off + 16;
+            for ( std::uint32_t i = 0; i < n; ++i, ent += 8 )
+            {
+                if ( ent + 8 > size )
+                    break;
+                const auto next = read_u32( base + ent + 4 );
+                const auto to = next & 0x7fffffffu;
+                if ( next & 0x80000000u )
+                {
+                    self( self, to, depth + 1 );
+                    continue;
+                }
+                if ( to + 4 > size )
+                    continue;
+                write_u32( base + to, static_cast< std::uint32_t >( static_cast< std::int32_t >( read_u32( base + to ) ) + delta ) );
+            }
+        };
+        walk( walk, 0, 0 );
+    }
+
+    auto section_kept( const sec& s, const std::vector< sec >& kept ) -> bool
+    {
+        for ( const auto& k : kept )
+        {
+            if ( k.src == s.src && std::memcmp( k.name, s.name, 8 ) == 0 )
+                return true;
+        }
+        return false;
     }
 
     auto is_api_set( const std::string& m ) -> bool
@@ -441,7 +520,7 @@ auto count_resolved_imports( const runtime_image& img ) -> std::size_t
     }
 }
 
-auto rebuild_iat( runtime_image& img ) -> std::vector< std::uint8_t >
+auto rebuild_iat( runtime_image& img, bool strip_vmp ) -> std::vector< std::uint8_t >
 {
     if ( img.bytes.size( ) < 0x200 )
         throw std::runtime_error( "empty dump" );
@@ -495,9 +574,76 @@ auto rebuild_iat( runtime_image& img ) -> std::vector< std::uint8_t >
     const auto width = img.is64 ? 8u : 4u;
     const auto ord_flag = img.is64 ? IMAGE_ORDINAL_FLAG64 : IMAGE_ORDINAL_FLAG32;
 
-    std::uint32_t last_end = p.size_of_image;
-    for ( const auto& s : secs )
+    std::vector< sec > kept;
+    if ( strip_vmp )
+    {
+        kept.reserve( secs.size( ) );
+        for ( const auto& s : secs )
+        {
+            if ( keep_unpacked_section( s ) )
+                kept.push_back( s );
+        }
+        if ( kept.empty( ) )
+        {
+            for ( const auto& s : secs )
+            {
+                if ( !is_vm_section_name( s.name ) )
+                    kept.push_back( s );
+            }
+        }
+        if ( kept.empty( ) )
+            throw std::runtime_error( "strip-vmp: no original sections remain" );
+
+        std::sort( kept.begin( ), kept.end( ), [ ]( const sec& a, const sec& b )
+        {
+            return a.src < b.src;
+        } );
+
+        std::uint32_t cursor = 0;
+        auto saw_gap = false;
+        for ( auto& s : kept )
+        {
+            const auto span = mapped( s );
+            if ( !cursor )
+            {
+                cursor = align_up( s.va + span, p.section_align );
+                continue;
+            }
+            if ( !saw_gap && s.va <= cursor )
+            {
+                cursor = ( std::max )( cursor, align_up( s.va + span, p.section_align ) );
+                continue;
+            }
+            saw_gap = true;
+            s.va = cursor;
+            cursor = align_up( s.va + span, p.section_align );
+        }
+
+        std::printf( "iat: strip-vmp keeping %zu/%zu sections\n", kept.size( ), secs.size( ) );
+        for ( const auto& s : secs )
+        {
+            if ( section_kept( s, kept ) )
+                continue;
+            std::printf( "  drop %s va=0x%x size=0x%x\n", s.name, s.va, mapped( s ) );
+        }
+        for ( const auto& s : kept )
+        {
+            if ( s.va == s.src )
+                continue;
+            std::printf( "  move %s 0x%x -> 0x%x\n", s.name, s.src, s.va );
+        }
+        std::fflush( stdout );
+    }
+    else
+    {
+        kept = secs;
+    }
+
+    std::uint32_t last_end = strip_vmp ? 0 : p.size_of_image;
+    for ( const auto& s : kept )
         last_end = ( std::max )( last_end, s.va + mapped( s ) );
+    if ( !last_end )
+        last_end = p.size_of_image;
     const auto new_va = align_up( last_end, p.section_align );
 
     std::vector< std::uint8_t > extra( ( by_mod.size( ) + 1 ) * sizeof( IMAGE_IMPORT_DESCRIPTOR ), 0 );
@@ -626,16 +772,17 @@ auto rebuild_iat( runtime_image& img ) -> std::vector< std::uint8_t >
     const auto iat_rva = new_va + iat_off;
 
     auto size_of_headers = p.size_of_headers;
-    const auto hdr_need = p.section_off + ( p.section_count + 1 ) * k_section_hdr;
+    const auto out_sections = static_cast< std::uint32_t >( kept.size( ) + 1 );
+    const auto hdr_need = p.section_off + out_sections * k_section_hdr;
     if ( hdr_need > size_of_headers )
         size_of_headers = align_up( hdr_need, p.file_align );
 
-    std::vector< std::uint32_t > sec_raw( secs.size( ) );
-    std::vector< std::uint32_t > sec_raw_sz( secs.size( ) );
+    std::vector< std::uint32_t > sec_raw( kept.size( ) );
+    std::vector< std::uint32_t > sec_raw_sz( kept.size( ) );
     auto laid = size_of_headers;
-    for ( std::size_t i = 0; i < secs.size( ); ++i )
+    for ( std::size_t i = 0; i < kept.size( ); ++i )
     {
-        const auto span = mapped( secs[ i ] );
+        const auto span = mapped( kept[ i ] );
         sec_raw_sz[ i ] = span ? align_up( span, p.file_align ) : 0;
         sec_raw[ i ] = laid;
         laid += sec_raw_sz[ i ];
@@ -645,16 +792,18 @@ auto rebuild_iat( runtime_image& img ) -> std::vector< std::uint8_t >
 
     const auto hdr_copy = ( std::min )( { static_cast< std::size_t >( p.size_of_headers ), static_cast< std::size_t >( size_of_headers ), img.bytes.size( ) } );
     std::memcpy( out.data( ), img.bytes.data( ), hdr_copy );
-    for ( std::size_t i = 0; i < secs.size( ); ++i )
+    for ( std::size_t i = 0; i < kept.size( ); ++i )
     {
-        if ( !sec_raw_sz[ i ] || secs[ i ].va >= img.bytes.size( ) )
+        if ( !sec_raw_sz[ i ] || kept[ i ].src >= img.bytes.size( ) )
             continue;
-        const auto nbytes = ( std::min )( { static_cast< std::size_t >( mapped( secs[ i ] ) ), img.bytes.size( ) - secs[ i ].va, static_cast< std::size_t >( sec_raw_sz[ i ] ) } );
-        std::memcpy( out.data( ) + sec_raw[ i ], img.bytes.data( ) + secs[ i ].va, nbytes );
+        const auto nbytes = ( std::min )( { static_cast< std::size_t >( mapped( kept[ i ] ) ), img.bytes.size( ) - kept[ i ].src, static_cast< std::size_t >( sec_raw_sz[ i ] ) } );
+        std::memcpy( out.data( ) + sec_raw[ i ], img.bytes.data( ) + kept[ i ].src, nbytes );
+        if ( kept[ i ].va != kept[ i ].src && lower_copy( kept[ i ].name ) == ".rsrc" )
+            rebase_resources( out.data( ) + sec_raw[ i ], static_cast< std::uint32_t >( nbytes ), static_cast< std::int32_t >( kept[ i ].va - kept[ i ].src ) );
     }
     std::memcpy( out.data( ) + extra_raw_off, extra.data( ), extra.size( ) );
 
-    write_u16( out.data( ) + p.file + 2, static_cast< std::uint16_t >( p.section_count + 1 ) );
+    write_u16( out.data( ) + p.file + 2, static_cast< std::uint16_t >( out_sections ) );
     write_u16( out.data( ) + p.file + 18, static_cast< std::uint16_t >( p.characteristics | IMAGE_FILE_RELOCS_STRIPPED ) );
     if ( img.is64 )
         write_u64( out.data( ) + p.opt + 24, img.base );
@@ -678,17 +827,58 @@ auto rebuild_iat( runtime_image& img ) -> std::vector< std::uint8_t >
     write_dir( IMAGE_DIRECTORY_ENTRY_BASERELOC, 0, 0 );
     write_dir( IMAGE_DIRECTORY_ENTRY_TLS, 0, 0 );
 
-    for ( std::size_t i = 0; i < secs.size( ); ++i )
+    if ( strip_vmp )
     {
-        const auto off = p.section_off + static_cast< std::uint32_t >( i ) * k_section_hdr;
-        write_u32( out.data( ) + off + 16, sec_raw_sz[ i ] );
-        write_u32( out.data( ) + off + 20, sec_raw[ i ] );
+        const auto ndirs = img.is64 ? read_u32( out.data( ) + p.opt + 108 ) : read_u32( out.data( ) + p.opt + 92 );
+        for ( std::uint32_t i = 0; i < ndirs && i < 16; ++i )
+        {
+            if ( i == IMAGE_DIRECTORY_ENTRY_IMPORT || i == IMAGE_DIRECTORY_ENTRY_IAT )
+                continue;
+            const auto rva = read_u32( out.data( ) + p.dir_off + i * 8 );
+            if ( !rva )
+                continue;
+            if ( rva >= new_va && rva < new_va + extra_vsize )
+                continue;
+            if ( rva_in_sections( rva, kept ) )
+                continue;
+            write_dir( i, 0, 0 );
+        }
+        for ( const auto& s : kept )
+        {
+            if ( lower_copy( s.name ) != ".pdata" )
+                continue;
+            write_dir( IMAGE_DIRECTORY_ENTRY_EXCEPTION, s.va, s.vsize ? s.vsize : mapped( s ) );
+            break;
+        }
+        for ( const auto& s : kept )
+        {
+            if ( lower_copy( s.name ) != ".rsrc" )
+                continue;
+            write_dir( IMAGE_DIRECTORY_ENTRY_RESOURCE, s.va, s.vsize ? s.vsize : mapped( s ) );
+            break;
+        }
     }
 
-    const auto nh = p.section_off + p.section_count * k_section_hdr;
+    const auto old_table = static_cast< std::size_t >( p.section_count ) * k_section_hdr;
+    const auto new_table = static_cast< std::size_t >( out_sections ) * k_section_hdr;
+    const auto wipe = ( std::max )( old_table, new_table );
+    if ( p.section_off + wipe > out.size( ) )
+        throw std::runtime_error( "no room for section table" );
+    std::memset( out.data( ) + p.section_off, 0, wipe );
+    for ( std::size_t i = 0; i < kept.size( ); ++i )
+    {
+        const auto off = p.section_off + static_cast< std::uint32_t >( i ) * k_section_hdr;
+        std::memcpy( out.data( ) + off, kept[ i ].name, 8 );
+        write_u32( out.data( ) + off + 8, kept[ i ].vsize );
+        write_u32( out.data( ) + off + 12, kept[ i ].va );
+        write_u32( out.data( ) + off + 16, sec_raw_sz[ i ] );
+        write_u32( out.data( ) + off + 20, sec_raw[ i ] );
+        write_u32( out.data( ) + off + 36, kept[ i ].ch );
+    }
+
+    const auto nh = p.section_off + static_cast< std::uint32_t >( kept.size( ) ) * k_section_hdr;
     if ( nh + k_section_hdr > out.size( ) )
         throw std::runtime_error( "no room for another section header" );
-    std::memset( out.data( ) + nh, 0, k_section_hdr );
     std::memcpy( out.data( ) + nh, ".iat", 4 );
     write_u32( out.data( ) + nh + 8, extra_vsize );
     write_u32( out.data( ) + nh + 12, new_va );

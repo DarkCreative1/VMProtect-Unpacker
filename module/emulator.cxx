@@ -32,6 +32,13 @@ namespace
         std::size_t mem_size;
     };
 
+    struct write_log
+    {
+        std::uint64_t begin;
+        std::uint64_t end;
+        std::vector< std::pair< std::uint64_t, std::vector< std::uint8_t > > >* restores;
+    };
+
     auto fail( const char* op, uc_err err ) -> std::runtime_error
     {
         return std::runtime_error( std::string( op ) + ": " + uc_strerror( err ) );
@@ -97,6 +104,19 @@ namespace
         return false;
     }
 
+    auto hook_write( uc_engine* uc, uc_mem_type, std::uint64_t addr, int size, std::int64_t, void* user ) -> void
+    {
+        auto* log = static_cast< write_log* >( user );
+        if ( !log || !log->restores || size <= 0 )
+            return;
+        if ( addr < log->begin || addr >= log->end )
+            return;
+        std::vector< std::uint8_t > old( static_cast< std::size_t >( size ) );
+        if ( uc_mem_read( uc, addr, old.data( ), old.size( ) ) != UC_ERR_OK )
+            return;
+        log->restores->push_back( { addr, std::move( old ) } );
+    }
+
     auto read_u64( uc_engine* uc, int reg ) -> std::uint64_t
     {
         std::uint64_t v = 0;
@@ -129,10 +149,16 @@ namespace
             { 5, UC_X86_REG_EBP }, { 6, UC_X86_REG_ESI }, { 7, UC_X86_REG_EDI }
         };
     }
+
+    auto as_uc( void* p ) -> uc_engine*
+    {
+        return static_cast< uc_engine* >( p );
+    }
 }
 
+
 stub_emulator::stub_emulator( bool is64, std::uint64_t base, std::vector< std::uint8_t > snap )
-    : is64_( is64 ), base_( base ), snap_( std::move( snap ) )
+    : is64_( is64 ), base_( base ), snap_( std::move( snap ) ), uc_( nullptr )
 {
     if ( snap_.empty( ) )
         throw std::runtime_error( "the module snapshot is empty" );
@@ -150,49 +176,73 @@ stub_emulator::stub_emulator( bool is64, std::uint64_t base, std::vector< std::u
     const auto sb = stack_base( is64_ );
     if ( sb < base_ + mapped_ && base_ < sb + k_stack_size )
         throw std::runtime_error( "the synthetic stack overlaps the module snapshot" );
+
+    snap_.resize( static_cast< std::size_t >( mapped_ ), 0 );
+    uc_engine* uc = nullptr;
+    auto err = uc_open( UC_ARCH_X86, is64_ ? UC_MODE_64 : UC_MODE_32, &uc );
+    if ( err != UC_ERR_OK )
+        throw fail( "cannot create the emulator", err );
+    uc_ = uc;
+
+    err = uc_mem_map_ptr( uc, base_, static_cast< std::size_t >( mapped_ ), UC_PROT_ALL, snap_.data( ) );
+    if ( err != UC_ERR_OK )
+    {
+        err = uc_mem_map( uc, base_, static_cast< std::size_t >( mapped_ ), UC_PROT_ALL );
+        if ( err != UC_ERR_OK )
+        {
+            uc_close( uc );
+            uc_ = nullptr;
+            throw fail( "cannot map the module snapshot", err );
+        }
+        err = uc_mem_write( uc, base_, snap_.data( ), snap_.size( ) );
+        if ( err != UC_ERR_OK )
+        {
+            uc_close( uc );
+            uc_ = nullptr;
+            throw fail( "cannot write the module snapshot", err );
+        }
+    }
+
+    err = uc_mem_map( uc, sb, static_cast< std::size_t >( k_stack_size ), UC_PROT_ALL );
+    if ( err != UC_ERR_OK )
+    {
+        uc_close( uc );
+        uc_ = nullptr;
+        throw fail( "cannot map the synthetic stack", err );
+    }
 }
 
-auto stub_emulator::emulate( std::uint64_t stub, bool has_ret, std::uint64_t ret, std::size_t limit ) const -> emu_stop
+stub_emulator::~stub_emulator( )
 {
+    if ( uc_ )
+        uc_close( as_uc( uc_ ) );
+}
+
+
+auto stub_emulator::emulate( std::uint64_t stub, bool has_ret, std::uint64_t ret, std::size_t limit ) -> emu_stop
+{
+    if ( !uc_ )
+        throw std::runtime_error( "emulator is not initialized" );
     if ( stub < base_ || stub >= end_ )
         throw std::runtime_error( "stub entry address is outside the module snapshot" );
     if ( has_ret && ( ret < base_ || ret >= end_ ) )
         throw std::runtime_error( "return address is outside the module snapshot" );
 
-    uc_engine* uc = nullptr;
-    auto err = uc_open( UC_ARCH_X86, is64_ ? UC_MODE_64 : UC_MODE_32, &uc );
-    if ( err != UC_ERR_OK )
-        throw fail( "cannot create the emulator", err );
-
-    struct closer
-    {
-        uc_engine* uc;
-        ~closer( )
-        {
-            if ( uc )
-                uc_close( uc );
-        }
-    } guard{ uc };
-
-    err = uc_mem_map( uc, base_, static_cast< std::size_t >( mapped_ ), UC_PROT_ALL );
-    if ( err != UC_ERR_OK )
-        throw fail( "cannot map the module snapshot", err );
-    err = uc_mem_write( uc, base_, snap_.data( ), snap_.size( ) );
-    if ( err != UC_ERR_OK )
-        throw fail( "cannot write the module snapshot", err );
-
-    const auto sb = stack_base( is64_ );
-    err = uc_mem_map( uc, sb, static_cast< std::size_t >( k_stack_size ), UC_PROT_ALL );
-    if ( err != UC_ERR_OK )
-        throw fail( "cannot map the synthetic stack", err );
+    auto* uc = as_uc( uc_ );
+    for ( const auto& g : gprs( is64_ ) )
+        write_u64( uc, g.second, 0 );
+    write_u64( uc, is64_ ? UC_X86_REG_RIP : UC_X86_REG_EIP, stub );
+    write_u64( uc, UC_X86_REG_EFLAGS, k_flags );
 
     const auto sp = stack_ptr( is64_ );
+    std::vector< std::uint8_t > stack_page( static_cast< std::size_t >( k_page ), 0 );
+    auto err = uc_mem_write( uc, sp, stack_page.data( ), stack_page.size( ) );
+    if ( err != UC_ERR_OK )
+        throw fail( "cannot reset the synthetic stack", err );
     if ( has_ret )
     {
         if ( is64_ )
-        {
             err = uc_mem_write( uc, sp, &ret, 8 );
-        }
         else
         {
             const auto r32 = static_cast< std::uint32_t >( ret );
@@ -202,7 +252,6 @@ auto stub_emulator::emulate( std::uint64_t stub, bool has_ret, std::uint64_t ret
             throw fail( "cannot write the synthetic return address", err );
     }
     write_u64( uc, is64_ ? UC_X86_REG_RSP : UC_X86_REG_ESP, sp );
-    write_u64( uc, UC_X86_REG_EFLAGS, k_flags );
 
     monitor mon{};
     mon.begin = base_;
@@ -210,13 +259,18 @@ auto stub_emulator::emulate( std::uint64_t stub, bool has_ret, std::uint64_t ret
     mon.has_ret = has_ret;
     mon.ret = ret;
     mon.kind = emu_stop_kind::limit;
-    uc_hook h1{}, h2{};
+    std::vector< std::pair< std::uint64_t, std::vector< std::uint8_t > > > restores;
+    write_log log{ base_, end_, &restores };
+    uc_hook h1{}, h2{}, h3{};
     err = uc_hook_add( uc, &h1, UC_HOOK_CODE, reinterpret_cast< void* >( hook_code ), &mon, 1, 0 );
     if ( err != UC_ERR_OK )
         throw fail( "cannot install the instruction hook", err );
     err = uc_hook_add( uc, &h2, UC_HOOK_MEM_UNMAPPED, reinterpret_cast< void* >( hook_mem ), &mon, 1, 0 );
     if ( err != UC_ERR_OK )
         throw fail( "cannot install the memory hook", err );
+    err = uc_hook_add( uc, &h3, UC_HOOK_MEM_WRITE, reinterpret_cast< void* >( hook_write ), &log, base_, end_ - 1 );
+    if ( err != UC_ERR_OK )
+        throw fail( "cannot install the write hook", err );
 
     err = uc_emu_start( uc, stub, 0, 0, limit );
     emu_stop out{};
@@ -231,6 +285,14 @@ auto stub_emulator::emulate( std::uint64_t stub, bool has_ret, std::uint64_t ret
         }
         err = UC_ERR_OK;
     }
+
+    for ( auto it = restores.rbegin( ); it != restores.rend( ); ++it )
+        uc_mem_write( uc, it->first, it->second.data( ), it->second.size( ) );
+    uc_hook_del( uc, h3 );
+    uc_hook_del( uc, h2 );
+    uc_hook_del( uc, h1 );
+
+
     if ( mon.stopped )
     {
         out.kind = mon.kind;

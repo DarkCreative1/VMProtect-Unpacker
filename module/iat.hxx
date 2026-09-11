@@ -29,5 +29,5 @@ struct runtime_image
     std::vector< export_sym > exports;
 };
 
-auto rebuild_iat( runtime_image& img ) -> std::vector< std::uint8_t >;
+auto rebuild_iat( runtime_image& img, bool strip_vmp = false ) -> std::vector< std::uint8_t >;
 auto count_resolved_imports( const runtime_image& img ) -> std::size_t;

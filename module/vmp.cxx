@@ -12,8 +12,10 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <map>
+
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -25,8 +27,9 @@ namespace
     constexpr auto k_max_sections = 96u;
     constexpr auto k_section_hdr = 40u;
     constexpr auto k_entropy_min = 7.0;
-    constexpr auto k_stub_limit = 100000u;
+    constexpr auto k_stub_limit = 768u;
     constexpr auto k_max_stub_insns = 768u;
+
     constexpr auto k_max_patch = 32u;
 
     auto read_u16( const std::uint8_t* p ) -> std::uint16_t
@@ -72,18 +75,26 @@ namespace
         return a.name < b.name;
     }
 
-    auto pick_export( const runtime_image& img, std::uint64_t addr ) -> const export_sym*
+    using export_index = std::map< std::uint64_t, const export_sym* >;
+
+    auto index_exports( const runtime_image& img ) -> export_index
     {
-        const export_sym* best = nullptr;
+        export_index idx;
         for ( const auto& e : img.exports )
         {
-            if ( e.address != addr )
-                continue;
-            if ( !best || better( e, *best ) )
-                best = &e;
+            auto it = idx.find( e.address );
+            if ( it == idx.end( ) || better( e, *it->second ) )
+                idx[ e.address ] = &e;
         }
-        return best;
+        return idx;
     }
+
+    auto pick_export( const export_index& idx, std::uint64_t addr ) -> const export_sym*
+    {
+        const auto it = idx.find( addr );
+        return it == idx.end( ) ? nullptr : it->second;
+    }
+
 
     struct vsec
     {
@@ -202,16 +213,31 @@ namespace
         bool has_abs0;
     };
 
+    auto cached_decoder( bool is64 ) -> const ZydisDecoder*
+    {
+        static ZydisDecoder dec64{}, dec32{};
+        static int state64 = 0, state32 = 0;
+        auto& state = is64 ? state64 : state32;
+        auto& dec = is64 ? dec64 : dec32;
+        if ( state == 0 )
+        {
+            state = ZYAN_SUCCESS( ZydisDecoderInit( &dec,
+                is64 ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32,
+                is64 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32 ) ) ? 1 : -1;
+        }
+        return state > 0 ? &dec : nullptr;
+    }
+
     auto decode_at( const runtime_image& img, std::uint32_t rva ) -> decoded
     {
         decoded d{};
         if ( rva >= img.bytes.size( ) )
             return d;
-        ZydisDecoder dec;
-        if ( !ZYAN_SUCCESS( ZydisDecoderInit( &dec, img.is64 ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32, img.is64 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32 ) ) )
+        const auto* dec = cached_decoder( img.is64 );
+        if ( !dec )
             return d;
         ZydisDecodedInstruction insn;
-        if ( !ZYAN_SUCCESS( ZydisDecoderDecodeFull( &dec, img.bytes.data( ) + rva, img.bytes.size( ) - rva, &insn, d.ops ) ) )
+        if ( !ZYAN_SUCCESS( ZydisDecoderDecodeFull( dec, img.bytes.data( ) + rva, img.bytes.size( ) - rva, &insn, d.ops ) ) )
             return d;
         d.ok = true;
         d.len = insn.length;
@@ -222,6 +248,7 @@ namespace
             d.has_abs0 = true;
         return d;
     }
+
 
     auto zy_reg( ZydisRegister r ) -> std::uint8_t
     {
@@ -480,7 +507,11 @@ namespace
                 continue;
             for ( auto rva = s.va; rva + 5 <= s.va + s.span && rva + 5 <= img.bytes.size( ); ++rva )
             {
+                const auto op = img.bytes[ rva ];
+                if ( op != 0xE8 && op != 0xE9 )
+                    continue;
                 const auto d = decode_at( img, rva );
+
                 if ( !( is_rel_call( d ) || is_rel_jmp( d ) ) || !d.has_abs0 || d.abs0 < img.base )
                     continue;
                 const auto stub = static_cast< std::uint32_t >( d.abs0 - img.base );
@@ -604,19 +635,20 @@ namespace
         return b.mnemonic == ZYDIS_MNEMONIC_JMP || b.mnemonic == ZYDIS_MNEMONIC_CALL;
     }
 
-    auto classify_stop( const runtime_image& img, const std::vector< vsec >& secs, const xfer& x, const emu_stop& stop, vm_stub& st ) -> bool
+    auto classify_stop( const runtime_image& img, const export_index& idx, const std::vector< vsec >& secs, const xfer& x, const emu_stop& stop, vm_stub& st ) -> bool
     {
         auto kind = stop.kind;
         auto dest = stop.dest;
         if ( kind == emu_stop_kind::unmapped )
         {
             const auto maybe = dest ? dest : stop.insn_addr;
-            if ( pick_export( img, maybe ) )
+            if ( pick_export( idx, maybe ) )
             {
                 kind = emu_stop_kind::external;
                 dest = maybe;
             }
         }
+
         if ( kind == emu_stop_kind::limit || kind == emu_stop_kind::unmapped )
             return false;
         if ( stop.insns > k_max_stub_insns )
@@ -627,7 +659,8 @@ namespace
         const auto w = img.is64 ? 8 : 4;
         if ( kind == emu_stop_kind::external )
         {
-            const auto* exp = pick_export( img, dest );
+            const auto* exp = pick_export( idx, dest );
+
             if ( !exp )
                 return false;
             auto has_resume = false;
@@ -693,7 +726,7 @@ namespace
             const emu_reg* hit = nullptr;
             for ( const auto& r : stop.regs )
             {
-                if ( pick_export( img, r.bits ) )
+                if ( pick_export( idx, r.bits ) )
                 {
                     if ( hit )
                         return false;
@@ -702,7 +735,8 @@ namespace
             }
             if ( !hit || !x.has_ret )
                 return false;
-            const auto* exp = pick_export( img, hit->bits );
+            const auto* exp = pick_export( idx, hit->bits );
+
             if ( !exp )
                 return false;
             st.type = k_vm_mov;
@@ -810,6 +844,9 @@ auto recover_vm_stubs( const runtime_image& img ) -> std::vector< vm_stub >
 
     stub_emulator emu( img.is64, img.base, img.bytes );
     const auto xfers = find_xfers( img, secs );
+    std::printf( "vmp: xfers=%zu\n", xfers.size( ) );
+    std::fflush( stdout );
+    const auto idx = index_exports( img );
     std::map< std::uint32_t, emu_stop > stops;
     std::set< std::uint32_t > failed;
     for ( const auto& x : xfers )
@@ -838,7 +875,7 @@ auto recover_vm_stubs( const runtime_image& img ) -> std::vector< vm_stub >
             }
         }
         vm_stub st{};
-        if ( !classify_stop( img, secs, x, stop, st ) )
+        if ( !classify_stop( img, idx, secs, x, stop, st ) )
             continue;
         if ( !st.len || st.rva >= img.bytes.size( ) || static_cast< std::size_t >( st.rva ) + st.len > img.bytes.size( ) )
             continue;
