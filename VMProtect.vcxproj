@@ -147,7 +147,9 @@
     <ClCompile Include="module\decompression2.cxx" />
     <ClCompile Include="module\emulator.cxx" />
     <ClCompile Include="module\iat.cxx" />
+    <ClCompile Include="module\lifter.cxx" />
     <ClCompile Include="module\oep.cxx" />
+    <ClCompile Include="module\static_iat.cxx" />
     <ClCompile Include="module\vmp.cxx" />
   </ItemGroup>
   <ItemGroup>
