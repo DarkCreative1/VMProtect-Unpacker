@@ -45,11 +45,22 @@ jobs:
             Write-Host $_.FullName
           }
 
+      - name: Collect runtime files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+
+          Copy-Item "x64\Release\VMProtect.exe" "artifact\"
+
+          Copy-Item "C:\vcpkg\installed\x64-windows\bin\unicorn.dll" "artifact\"
+          Copy-Item "C:\vcpkg\installed\x64-windows\bin\Zydis.dll" "artifact\"
+          Copy-Item "C:\vcpkg\installed\x64-windows\bin\Zycore.dll" "artifact\"
+
+          Get-ChildItem artifact
+
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
           name: VMProtect-Unpacker-x64
-          path: |
-            **/Release/*.exe
-            **/x64/Release/*.exe
+          path: artifact/*
           if-no-files-found: error
